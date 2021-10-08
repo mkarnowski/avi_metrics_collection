@@ -1,7 +1,7 @@
 #!/opt/local/bin/python3
 
 
-version = 'v2019-11-12'
+version = 'v2021-09-23'
 
 
 
@@ -41,8 +41,480 @@ import logging
 import traceback
 import sys
 import os
-from metrics_endpoints import *
 import _pickle as pickle
+import socket
+from requests.auth import HTTPBasicAuth
+
+
+
+
+#---------------------------------------------------------------
+#--------------- Metrics Endpoint functions Begin --------------
+#---------------------------------------------------------------
+
+
+
+
+#----- Send value to appdynamics
+def send_value_appdynamics_machine(endpoint_info, appd_payload):
+    try:
+        for entry in appd_payload:
+            if 'name_space' in entry:
+                name_space = entry['name_space'].replace('||','|')
+                #----- used for migration from old script
+                if 'host_location' and 'host_environment' in entry:
+                    name_space = name_space.replace('avi.', 'avi.'+entry['host_location']+'.'+entry['host_environment']+'.')            
+                print('name=Custom Metrics|%s,value=%d,aggregator=OBSERVATION,time-rollup=CURRENT,cluster-rollup=INDIVIDUAL' % (name_space, int(entry['metric_value'])))
+    except:
+        exception_text = traceback.format_exc()
+        print(str(datetime.now())+'   '+exception_text)
+
+
+
+
+#----- this is to send to appdynamics machine agent http listener
+def send_value_appdynamics_http(endpoint_info, appd_payload):
+    try:
+        payload = []
+        for entry in appd_payload:
+            if 'name_space' in entry:
+                name_space = entry['name_space'].replace('||','|')
+                #----- used for migration from old script
+                if 'host_location' and 'host_environment' in entry:
+                    name_space = name_space.replace('avi.', 'avi.'+entry['host_location']+'.'+entry['host_environment']+'.')            
+                temp_payload = {}
+                temp_payload['metricName'] = 'Custom Metrics|'+name_space
+                temp_payload['aggregatorType'] = 'OBSERVATION'
+                temp_payload['value'] = int(entry['metric_value'])
+                payload.append(temp_payload)
+        if len(payload) > 0:
+            headers = ({'content-type': 'application/json'})
+            resp = requests.post('http://%s:%s/api/v1/metrics' %(endpoint_info['server'],endpoint_info['server_port']),headers = headers, data=json.dumps(payload), timeout=15)
+            if resp.status_code != 204:
+                print(resp)
+        #if resp.status_code != 202:
+        #    print resp
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)
+
+
+
+
+#----- Send value to datadog
+def send_value_datadog(endpoint_info, datadog_payload):
+    try:
+        keys_to_remove=["avicontroller","timestamp","metric_value","metric_name","name_space"]
+        series_list = []
+        datadog_payload_template = {
+             "metric":"",
+             "points":"",
+             "host":"",
+             "tags":""
+             }
+        for entry in datadog_payload:
+            temp_payload = datadog_payload_template.copy()
+            temp_payload['metric'] = entry['metric_name']
+            temp_payload['points'] = [[entry['timestamp'],entry['metric_value']]]
+            temp_payload['host'] = entry['avicontroller']
+            #for k in keys_to_remove:
+            #    entry.pop(k, None)
+            tag_list = []
+            for e in entry:
+                if e not in keys_to_remove:
+                    tag_list.append(str(e+':'+entry[e]))
+            temp_payload['tags'] = tag_list
+            series_list.append(temp_payload)
+        payload = {'series': series_list}
+        headers = ({'content-type': 'application/json'})
+        resp = requests.post('https://%s%s' %(endpoint_info['api_url'],endpoint_info['api_key']), verify=False, headers = headers, data=json.dumps(payload), timeout=15)
+        if resp.status_code != 202:
+            print(resp)
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)
+
+
+
+
+#----- Send value to elasticsearch
+def send_value_elasticsearch(endpoint_info, payload):
+    try:
+        keys_to_remove = ['name_space']
+        for entry in payload:
+            for k in keys_to_remove:
+                entry.pop(k,None)
+            entry[endpoint_info['timestamp']] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+            entry['metric_value'] = float(entry['metric_value'])
+            headers = ({'content-type': 'application/json'})
+            if str(endpoint_info['auth-enabled']).lower() == 'true':
+                resp = requests.post('%s://%s:%s/%s/_doc' %(endpoint_info['protocol'],endpoint_info['server'], endpoint_info['server_port'], endpoint_info['index']) ,headers = headers, data=json.dumps(entry), timeout=15, auth=(endpoint_info['username'],endpoint_info['password']))
+            else:
+                resp = requests.post('%s://%s:%s/%s/_doc' %(endpoint_info['protocol'],endpoint_info['server'], endpoint_info['server_port'], endpoint_info['index']) ,headers = headers, data=json.dumps(entry), timeout=15)
+            if resp.status_code != 201:
+                print(resp.text)
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)
+
+
+
+
+#----- Send value to graphite
+def send_value_graphite(endpoint_info, graphite_payload):
+    try:
+        message_list = []
+        name_space_prefix = 'network-script||'
+        for entry in graphite_payload:
+            if 'name_space' in entry:
+                name_space = (name_space_prefix+entry['name_space']).replace('.','_').replace('||','.').replace(' ','_')
+                #----- used for migration from old script
+                if 'host_location' and 'host_environment' in entry:
+                    name_space = name_space.replace('avi.', 'avi.'+entry['host_location']+'.'+entry['host_environment']+'.')            
+                message_list.append('%s %f %d' %(name_space, entry['metric_value'], entry['timestamp']))
+                #----- I believe there is a message list limit on graphite for plain text
+                if sys.getsizeof(message_list) > 4915:
+                    message = '\n'.join(message_list) + '\n'
+                    socket.setdefaulttimeout(10)
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((endpoint_info['server'], endpoint_info['server_port']))
+                    sock.send(message.encode())
+                    sock.close()
+                    message_list = []
+        if len(message_list) > 0:
+            message = '\n'.join(message_list) + '\n'
+            socket.setdefaulttimeout(10)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((endpoint_info['server'], endpoint_info['server_port']))
+            sock.send(message.encode())
+            sock.close()
+
+    except:
+        exception_text = traceback.format_exc()
+        print(str(datetime.now())+'   '+exception_text)
+        print(message)
+
+
+
+
+#----- Send value to influxdb
+def send_value_influxdb(endpoint_info, influx_payload):
+    try:
+        tag_to_ignore = ['metric_name', 'timestamp', 'metric_value','name_space']
+        if endpoint_info.get('metric_prefix') == None:
+            metric_prefix = ''
+        else:
+            metric_prefix = endpoint_info['metric_prefix']
+        message_list = []
+        auth_enabled = False
+        if 'auth-enabled' in endpoint_info:
+            if str(endpoint_info['auth-enabled']).lower() == 'true':
+                auth_enabled = True
+        for entry in influx_payload:
+            tag_list=[]
+            for k in entry:
+                if k not in tag_to_ignore:
+                    tag_list.append((k+'='+entry[k]).replace(' ', '\\'))
+            tag_list = ','.join(tag_list)
+            temp_payload='%s%s,%s value=%f' %(metric_prefix, entry['metric_name'],tag_list,entry['metric_value'])
+            message_list.append(temp_payload)
+            if sys.getsizeof(message_list) > 4915:
+                message = '\n'.join(message_list) + '\n'
+                headers = ({'content-type': 'octet-stream'})
+                if auth_enabled == True:
+                    resp = requests.post('%s://%s:%s/write?db=%s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['db']),verify=False,headers = headers, data=message, timeout=15, auth=(endpoint_info['username'],endpoint_info['password']))
+                    message_list = []
+                else:
+                    resp = requests.post('%s://%s:%s/write?db=%s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['db']),verify=False,headers = headers, data=message, timeout=15)
+                    message_list = []
+                if resp.status_code == 401:
+                    print(str(datetime.now())+' '+endpoint_info['server']+': UNAUTHORIZED')
+                elif resp.status_code == 403:
+                    print(str(datetime.now())+' '+endpoint_info['server']+': FORBIDDEN')
+        message = '\n'.join(message_list) + '\n'
+        headers = ({'content-type': 'octet-stream'})
+        if str(endpoint_info['auth-enabled']).lower() == 'true':
+            resp = requests.post('%s://%s:%s/write?db=%s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['db']),verify=False,headers = headers, data=message, timeout=15, auth=(endpoint_info['username'],endpoint_info['password']))
+        else:
+            resp = requests.post('%s://%s:%s/write?db=%s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['db']),verify=False,headers = headers, data=message, timeout=15)
+        if resp.status_code == 401:
+            print(str(datetime.now())+' '+endpoint_info['server']+': UNAUTHORIZED')
+        elif resp.status_code == 403:
+            print(str(datetime.now())+' '+endpoint_info['server']+': FORBIDDEN')
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)
+            
+
+
+
+
+
+#----- Send value to influxdb_v2
+def send_value_influxdb_v2(endpoint_info, influx_payload):
+    try:
+        tag_to_ignore = ['metric_name', 'timestamp', 'metric_value','name_space']
+        if endpoint_info.get('metric_prefix') == None:
+            metric_prefix = ''
+        else:
+            metric_prefix = endpoint_info['metric_prefix']
+        message_list = []
+        auth_enabled = False
+        if 'auth-enabled' in endpoint_info:
+            if str(endpoint_info['auth-enabled']).lower() == 'true':
+                auth_enabled = True
+        for entry in influx_payload:
+            tag_list=[]
+            for k in entry:
+                if k not in tag_to_ignore:
+                    tag_list.append((k+'='+entry[k]).replace(' ', '\\'))
+            tag_list = ','.join(tag_list)
+            temp_payload='%s%s,%s value=%f' %(metric_prefix, entry['metric_name'],tag_list,entry['metric_value'])
+            message_list.append(temp_payload)
+            if sys.getsizeof(message_list) > 4915:
+                message = '\n'.join(message_list) + '\n'
+                headers = ({'content-type': 'octet-stream','Authorization': 'Token %s' %endpoint_info['token']})
+                if auth_enabled == True:
+                    resp = requests.post('%s://%s:%s/api/v2/write?org=%s&bucket=%s&precision=s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['org'],endpoint_info['bucket']),verify=False,headers = headers, data=message, timeout=15, auth=(endpoint_info['username'],endpoint_info['password']))
+                    message_list = []
+                else:
+                    resp = requests.post('%s://%s:%s/api/v2/write?org=%s&bucket=%s&precision=s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['org'],endpoint_info['bucket']),verify=False,headers = headers, data=message, timeout=15)
+                    message_list = []
+                if resp.status_code == 401:
+                    print(str(datetime.now())+' '+endpoint_info['server']+': UNAUTHORIZED')
+                elif resp.status_code == 403:
+                    print(str(datetime.now())+' '+endpoint_info['server']+': FORBIDDEN')
+        message = '\n'.join(message_list) + '\n'
+        headers = ({'content-type': 'octet-stream','Authorization': 'Token %s' %endpoint_info['token']})
+        if str(endpoint_info['auth-enabled']).lower() == 'true':
+            resp = requests.post('%s://%s:%s/api/v2/write?org=%s&bucket=%s&precision=s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['org'],endpoint_info['bucket']),verify=False,headers = headers, data=message, timeout=15, auth=(endpoint_info['username'],endpoint_info['password']))
+        else:
+            resp = requests.post('%s://%s:%s/api/v2/write?org=%s&bucket=%s&precision=s' %(endpoint_info['protocol'],endpoint_info['server'],endpoint_info['server_port'],endpoint_info['org'],endpoint_info['bucket']),verify=False,headers = headers, data=message, timeout=15)
+        if resp.status_code == 401:
+            print(str(datetime.now())+' '+endpoint_info['server']+': UNAUTHORIZED')
+        elif resp.status_code == 403:
+            print(str(datetime.now())+' '+endpoint_info['server']+': FORBIDDEN')
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)
+
+
+
+#----- Send value to logstash
+def send_value_logstash(endpoint_info, payload):
+    try:
+        keys_to_remove = ['name_space','timestamp']
+        proto = 'udp'
+        if endpoint_info.get('protocol') != None:
+            if endpoint_info['protocol'].lower() == 'tcp':
+                proto = 'tcp'
+        if proto == 'udp':
+            for entry in payload:
+                udpsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                for k in keys_to_remove:
+                    entry.pop(k,None)
+                message = '\n'+(json.dumps(entry))+'\n'
+                udpsock.sendto(message.encode(),(endpoint_info['server'],endpoint_info['server_port']))
+                udpsock.close()
+        else:
+            message_list = []
+            tcpsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tcpsock.connect((endpoint_info['server'], endpoint_info['server_port']))
+            socket.setdefaulttimeout(10)
+            for entry in payload:
+                for k in keys_to_remove:
+                    entry.pop(k,None)
+                message_list.append(json.dumps(entry))
+                if sys.getsizeof(message_list) > 1450:
+                    message = '\n'.join(message_list) + '\n'
+                    tcpsock.send(message.encode())
+                    message_list = []
+            message = '\n'.join(message_list) + '\n'
+            tcpsock.send(message.encode())
+            tcpsock.close()
+
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)
+
+
+#----- Send value to splunk HEC - destination is a metric index
+def send_value_splunk_hec_metric(endpoint_info, splunk_payload):
+    try:
+        splunk_payload_template = {
+            "source": "avi",
+            "event" : "metric",
+            "index": endpoint_info['index'],
+            "time": "",
+            "host": "",
+            "fields": {
+                "service": "avi",
+                "_value": "",
+                "metric_name": ""
+            }
+        }
+        hec_token = endpoint_info['hec_token']
+        headers = ({'Authorization': 'Splunk '+hec_token})
+        for entry in splunk_payload:
+            temp_entry = entry
+            keys_to_remove=["location","environment","avicontroller","timestamp","metric_value","metric_name","name_space"]
+            payload = splunk_payload_template.copy()
+            payload['host'] = temp_entry['avicontroller']
+            payload['time'] = temp_entry['timestamp']
+            payload['fields']['_value'] = temp_entry['metric_value']
+            payload['fields']['metric_name'] = temp_entry['metric_name']
+            for k in keys_to_remove:
+                entry.pop(k, None)
+            for e in entry:
+                payload["fields"][e]=entry[e]
+            resp = requests.post('%s://%s:%s/services/collector/event' %(endpoint_info['hec_protocol'], endpoint_info['server'], str(endpoint_info['hec_port'])) , verify=False, headers = headers, data=json.dumps(payload), timeout=15)
+            if resp.status_code == 400:
+                print(payload)
+    except:
+        exception_text = traceback.format_exc()
+        print(str(datetime.now())+'   '+exception_text)
+        print(entry)
+
+
+
+
+#----- Send value to splunk HEC
+def send_value_splunk_hec(endpoint_info, splunk_payload):
+    try:
+        splunk_payload_template = {
+            #"source": "",
+            "time": "",
+            "host": "",
+            "index": endpoint_info['index'],
+            "sourcetype": "avi:metrics",
+            "event": {
+                "avi_controller": ""
+            }
+        }
+        hec_token = endpoint_info['hec_token']
+        headers = ({'Authorization': 'Splunk '+hec_token})
+        for entry in splunk_payload:
+            temp_entry = entry
+            keys_to_remove=["avicontroller","name_space"]
+            payload = splunk_payload_template.copy()
+            payload['host'] = temp_entry['avicontroller']
+            #payload['source'] = temp_entry['avicontroller']
+            payload['time'] = temp_entry['timestamp']
+            payload['sourcetype'] = 'avi:metrics'
+            payload['event']['avi_controller'] = temp_entry['avicontroller']
+            for k in keys_to_remove:
+                entry.pop(k, None)
+            for e in entry:
+                payload["event"][e]=entry[e]
+            resp = requests.post('%s://%s:%s/services/collector/event' %(endpoint_info['hec_protocol'], endpoint_info['server'], str(endpoint_info['hec_port'])) , verify=False, headers = headers, data=json.dumps(payload), timeout=15)
+            if resp.status_code == 400:
+                print(resp.text)
+    except:
+        exception_text = traceback.format_exc()
+        print(str(datetime.now())+'   '+exception_text)
+        print(entry)
+
+
+
+
+
+def send_value_wavefront(endpoint_info, payload):
+    try:
+        keys_to_remove = ['name_space','timestamp','metric_name','metric_value']
+        message_list = []
+        if endpoint_info.get('metric_prefix') == None:
+            metric_prefix = ''
+        else:
+            metric_prefix = endpoint_info['metric_prefix']
+            if len(metric_prefix) > 0:
+                if metric_prefix[-1] !='.':
+                    metric_prefix = metric_prefix+'.'
+        if endpoint_info.get('api_key') != None:
+            wf_key = endpoint_info['api_key']
+            wf_proxy = False
+        else:
+            wf_proxy = True
+            if 'proxy_port' in endpoint_info:
+                wf_proxy_port = endpoint_info['proxy_port']
+            else:
+                wf_proxy_port = 2878
+        wf_instance = endpoint_info['instance']
+        for m in payload:
+            tag_list = []
+            metric_name = metric_prefix+m['metric_name']
+            metric_value = m['metric_value']
+            timestamp = m['timestamp']
+            for r in keys_to_remove:
+                m.pop(r, None)
+            for k,v in m.items():
+                tag_list.append(k+'="'+v+'"')
+            tag_list = (' '.join(tag_list))
+            metric = '%s %f %d source=%s %s' %(metric_name, metric_value, timestamp, m['avicontroller'], tag_list)
+            message_list.append(metric)
+        message_list.append('\n')
+        message = '\n'.join(message_list)
+        if wf_proxy == False:    
+            headers = ({'Authorization': 'Bearer '+wf_key, 'content-type': 'application/x-www-form-urlencoded'})
+            resp = requests.post('https://'+wf_instance+'/report', verify=False, headers = headers, data=message, timeout=15)
+            if resp.status_code != 202:
+                print('======> ERROR: send_to_wavefront', resp.status_code, resp.text)
+            #else:
+            #    print(str(datetime.now())+' ======> Metrics sent to wavefront')
+        else:
+            try:
+                socket.setdefaulttimeout(10)
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((wf_instance, wf_proxy_port))       
+                sock.sendall(message.encode())
+                sock.close()
+                #print(str(datetime.now())+' ======> Metrics sent to wavefront')
+            except:
+                print(str(datetime.now())+'  =====> ERROR: func send_to_wavefront encountered an error')
+                exception_text = traceback.format_exc()
+                print(str(datetime.now())+' : '+exception_text)
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)                
+
+
+
+
+
+#---------------------------------          
+
+
+def send_metriclist_to_endpoint(endpoint_list, payload):
+    try:
+        if endpoint_list != None:
+            for endpoint_info in endpoint_list:
+                if endpoint_info['type'] == 'graphite':
+                    send_value_graphite(endpoint_info, payload)
+                elif endpoint_info['type'] == 'splunk':
+                    if endpoint_info['index_type'].lower() == 'metric':
+                        send_value_splunk_hec_metric(endpoint_info, payload)
+                    else:
+                        send_value_splunk_hec(endpoint_info, payload)
+                elif endpoint_info['type'] == 'appdynamics_http':
+                    send_value_appdynamics_http(endpoint_info, payload)
+                elif endpoint_info['type'] == 'appdynamics_machine':
+                    send_value_appdynamics_machine(endpoint_info, payload)
+                elif endpoint_info['type'] == 'datadog':
+                    send_value_datadog(endpoint_info, payload)
+                elif endpoint_info['type'] == 'influxdb':
+                    send_value_influxdb(endpoint_info, payload)
+                elif endpoint_info['type'] == 'influxdb_v2':
+                    send_value_influxdb_v2(endpoint_info, payload)
+                elif endpoint_info['type'] == 'logstash':
+                    send_value_logstash(endpoint_info, payload)
+                elif endpoint_info['type'] == 'elasticsearch':
+                    send_value_elasticsearch(endpoint_info, payload)
+                elif endpoint_info['type'] == 'wavefront':
+                    send_value_wavefront(endpoint_info, payload)                    
+    except:
+        exception_text = traceback.format_exc()
+        print(exception_text)
+
+
 
 
 
@@ -55,6 +527,7 @@ def determine_endpoint_type(configuration):
         'splunk',
         'datadog',
         'influxdb',
+        'influxdb_v2',
         'logstash',
         'elasticsearch',
         'wavefront'
@@ -72,14 +545,18 @@ def determine_endpoint_type(configuration):
 
 
 
+#---------------------------------------------------------------
+#---------------- Metrics Endpoint functions END ---------------
+#---------------------------------------------------------------
+
 
 
 #----- This function allows for passwords to be either plaintext or base64 encoded
 def isBase64(password):
     try:
-        if base64.b64encode(base64.b64decode(b''+password)) == password:
-            if all(ord(c) < 128 for c in base64.b64decode(b''+password)):
-                return base64.b64decode(b''+password)
+        if base64.b64encode(base64.b64decode(password)).decode('utf-8') == password:
+            if all(ord(c) < 128 for c in base64.b64decode(password).decode('utf-8')):
+                return base64.b64decode(password).decode('utf-8')
             else:
                 return password
         else:
@@ -100,8 +577,6 @@ class avi_metrics():
         self.controller_config = controller_config
         #------ Default Metric Payload Template
         self.payload_template = {}
-        #self.payload_template['location'] = self.host_location
-        #self.payload_template['environment'] = self.host_environment
         self.payload_template['avicontroller'] = self.avi_cluster_name
         if controller_config.get('tags') != None:
             for k,v in controller_config['tags'].items():
@@ -143,6 +618,7 @@ class avi_metrics():
             self.controller_runtime = True
         else:
             self.controller_runtime = False
+        #------
         #------ PRINT CONFIGURATION ------
         print('-------------------------------------------------------------------')
         print('============ CONFIGURATION FOR: '+avi_cluster_name+':'+self.avi_cluster_ip+ ' ============')
@@ -323,6 +799,8 @@ class avi_metrics():
             'l7_server.pct_response_errors',
             'l7_server.avg_frustrated_responses',
             'l7_server.avg_total_requests',
+            'l7_server.avg_resp_4xx',
+            'l7_server.avg_resp_5xx', 
             'healthscore.health_score_value'
             ]
 
@@ -355,8 +833,41 @@ class avi_metrics():
                 return login
 
 
-    def avi_request(self,avi_api,tenant,api_version='17.2.1'):
+
+    def return_tenants(self):
+        try:
+            admin_access = False
+            for t in self.login.json()['tenants']:
+                if t['name'] == 'admin':
+                    admin_access = True
+            if admin_access == True:
+                resp = self.avi_request('tenant?page_size=200','admin')
+                if resp.status_code == 200:
+                    tenants_resp = resp.json()
+                    resp = tenants_resp
+                    page_number = 1
+                    while 'next' in resp:
+                        page_number += 1
+                        resp = self.avi_request('tenant?page_size=200&page='+str(page_number),'admin').json()
+                        for r in resp['results']:
+                            tenants_resp['results'].append(r)
+                    return tenants_resp['results']
+                else:
+                    return self.login.json()['tenants']
+            else:
+                return self.login.json()['tenants']
+        except:
+            exception_text = traceback.format_exc()
+            print(str(datetime.now())+' '+self.avi_cluster_ip+': '+exception_text)            
+            return self.login.json()['tenants'] 
+
+
+
+    def avi_request(self,avi_api,tenant,api_version=None):
         cookies=dict()
+        if api_version == None:
+            major,minor = self.login.json()['version']['Version'].rsplit('.',1)
+            api_version = '%s.%s' %(major,minor)
         if 'avi-sessionid' in self.login.cookies.keys():
             cookies['avi-sessionid'] = self.login.cookies['avi-sessionid']
         else:
@@ -365,8 +876,12 @@ class avi_metrics():
         return requests.get('https://%s/api/%s' %(self.avi_controller,avi_api), verify=False, headers = headers,cookies=cookies,timeout=50)
 
 
-    def avi_post(self,api_url,tenant,payload,api_version='17.2.1'):
+
+    def avi_post(self,api_url,tenant,payload,api_version=None):
         cookies=dict()
+        if api_version == None:
+            major,minor = self.login.json()['version']['Version'].rsplit('.',1)
+            api_version = '%s.%s' %(major,minor)        
         if 'avi-sessionid' in self.login.cookies.keys():
             cookies['avi-sessionid'] = self.login.cookies['avi-sessionid']
         else:
@@ -410,6 +925,14 @@ class avi_metrics():
             pool_dict = {}
             seg_dict = {}
             #------
+            self.vs_uuid_list = []
+            self.se_uuid_list = []
+            self.pool_uuid_list = []
+            if self.controller_config.get('virtualservice_stats_config').get('virtualservice_names') != None:
+                vs_name_list = self.controller_config.get('virtualservice_stats_config').get('virtualservice_names')
+            else:
+                vs_name_list = None
+            #------
             if self.vs_runtime == True:
                 vs_runtime = '&join_subresources=runtime'
             else:
@@ -421,7 +944,7 @@ class avi_metrics():
             #------               
             for t in self.tenants:
                 if self.vs_metrics == True or self.vs_runtime == True:
-                    vs_inv = self.avi_request('virtualservice?fields=cloud_ref,tenant_ref,se_group_ref&page_size=200&include_name=true&'+vs_runtime,t['name'])
+                    vs_inv = self.avi_request('virtualservice?fields=cloud_ref,tenant_ref,se_group_ref,markers&page_size=200&include_name=true'+vs_runtime,t['name'])
                     if vs_inv.status_code == 403:
                         print(str(datetime.now())+' =====> ERROR: virtualservice_inventory: %s' %vs_inv.text)
                     else:
@@ -430,20 +953,38 @@ class avi_metrics():
                         page_number = 1
                         while 'next' in resp:
                             page_number += 1
-                            resp = self.avi_request('virtualservice?fields=cloud_ref,tenant_ref,se_group_ref&page_size=200&include_name=true&page='+str(page_number)+vs_runtime,t['name']).json()
+                            resp = self.avi_request('virtualservice?fields=cloud_ref,tenant_ref,se_group_ref,markers&page_size=200&include_name=true&page='+str(page_number)+vs_runtime,t['name']).json()
                             for v in resp['results']:
                                 vs_inv['results'].append(v)
                         if vs_inv['count'] > 0:
                             for v in vs_inv['results']:
-                                vs_dict[v['uuid']] = {}
-                                vs_dict[v['uuid']]['name'] = v['name']
-                                vs_dict[v['uuid']]['tenant'] = v['tenant_ref'].rsplit('#')[1]
-                                vs_dict[v['uuid']]['cloud'] = v['cloud_ref'].rsplit('#')[1]
-                                vs_dict[v['uuid']]['se_group'] = v['se_group_ref'].rsplit('#')[1]
-                                vs_dict[v['uuid']]['results'] = v
+                                if vs_name_list == None or v['name'] in vs_name_list:
+                                    vs_dict[v['uuid']] = {}
+                                    vs_dict[v['uuid']]['name'] = v['name']
+                                    vs_dict[v['uuid']]['tenant'] = v['tenant_ref'].rsplit('#')[1]
+                                    vs_dict[v['uuid']]['cloud'] = v['cloud_ref'].rsplit('#')[1]
+                                    vs_dict[v['uuid']]['se_group'] = v['se_group_ref'].rsplit('#')[1]
+                                    vs_dict[v['uuid']]['results'] = v
+                                    if vs_name_list != None:
+                                        self.vs_uuid_list.append(v['uuid'])
+            #----- if specific VS names are specified, pull remaining objects specifically used by these vs uuids
+            if len(self.vs_uuid_list) > 0:
+                referred_by = []
+                for u in self.vs_uuid_list:
+                    referred_by.append('virtualservice:'+u)
+                referred_by = ','.join(referred_by)
+                referred_by = '&referred_by='+referred_by
+                se_referred_by = referred_by
+                pool_referred_by = referred_by
+            else:
+                se_referred_by = ''
+                pool_referred_by = ''
                 #---------------
+            for t in self.tenants:                                
                 if self.se_metrics == True or self.se_runtime == True:
-                    se_inv = self.avi_request('serviceengine?fields=cloud_ref,tenant_ref,se_group_ref,vs_refs&page_size=200&include_name=true'+se_runtime,t['name'])
+                    if self.controller_config.get('serviceengine_stats_config').get('ignore_virtualservice_names') == True:
+                        se_referred_by = ''
+                    se_inv = self.avi_request('serviceengine?fields=cloud_ref,tenant_ref,se_group_ref,vs_refs&page_size=200&include_name=true'+se_runtime+se_referred_by,t['name'])
                     if se_inv.status_code == 403:
                         print(str(datetime.now())+' =====> ERROR: serviceengine_inventory: %s' %se_inv.text)
                     else:
@@ -452,11 +993,13 @@ class avi_metrics():
                         page_number = 1
                         while 'next' in resp:
                             page_number += 1
-                            resp = self.avi_request('serviceengine?fields=cloud_ref,tenant_ref,se_group_ref,vs_refs&page_size=200&include_name=true&page='+str(page_number)+se_runtime,t['name']).json()
+                            resp = self.avi_request('serviceengine?fields=cloud_ref,tenant_ref,se_group_ref,vs_refs&page_size=200&include_name=true&page='+str(page_number)+se_runtime+se_referred_by,t['name']).json()
                             for s in resp['results']:
                                 se_inv['results'].append(s)
                         if se_inv['count'] > 0:
                             for s in se_inv['results']:
+                                if se_referred_by != '':
+                                    self.se_uuid_list.append(s['uuid'])
                                 se_dict[s['uuid']] = {}
                                 se_dict[s['uuid']]['name'] = s['name']
                                 se_dict[s['uuid']]['tenant'] = s['tenant_ref'].rsplit('#')[1]
@@ -472,7 +1015,7 @@ class avi_metrics():
                                     se_dict[s['uuid']]['virtualservices'] = []
                 #---------------     
                 if self.pool_metrics == True or self.pool_runtime == True:                       
-                    pool_inv = self.avi_request('pool-inventory?include_name=true&page_size=200',t['name'])
+                    pool_inv = self.avi_request('pool-inventory?include_name=true&page_size=200'+pool_referred_by,t['name'])
                     if pool_inv.status_code == 403:
                         print(str(datetime.now())+' =====> ERROR: pool_inventory: %s' %pool_inv.text)
                     else:
@@ -481,18 +1024,20 @@ class avi_metrics():
                         page_number = 1
                         while 'next' in resp:
                             page_number += 1
-                            resp = self.avi_request('pool-inventory?include_name=true&page_size=200&page='+str(page_number),t['name']).json()
+                            resp = self.avi_request('pool-inventory?include_name=true&page_size=200&page='+str(page_number)+pool_referred_by,t['name']).json()
                             for p in resp['results']:
                                 pool_inv['results'].append(p)   
                         if pool_inv['count'] > 0:
                             for p in pool_inv['results']:
+                                if pool_referred_by != '':
+                                    self.pool_uuid_list.append(p['uuid'])
                                 pool_dict[p['uuid']] = {}
                                 pool_dict[p['uuid']]['name'] = p['config']['name']
                                 pool_dict[p['uuid']]['tenant'] = p['config']['tenant_ref'].rsplit('#')[1]
                                 pool_dict[p['uuid']]['cloud'] = p['config']['cloud_ref'].rsplit('#')[1]
                                 pool_dict[p['uuid']]['results'] = p                                                 
                 #---------------                            
-                seg_inv = self.avi_request('serviceenginegroup?fields=max_vs_per_se,cloud_ref,tenant_ref&include_name&page_size=200',t['name'])                       
+                seg_inv = self.avi_request('serviceenginegroup?fields=max_vs_per_se,cloud_ref,tenant_ref&include_name&page_size=200'+se_referred_by,t['name'])                       
                 if seg_inv.status_code == 403:
                     print(str(datetime.now())+' =====> ERROR: serviceengine_group_inventory: %s' %seg_inv.text)
                 else:
@@ -677,13 +1222,17 @@ class avi_metrics():
         try:
             temp_start_time = time.time()
             endpoint_payload_list = []
+            if self.se_uuid_list == []:
+                self.se_uuid_list = '*'
+            else:
+                self.se_uuid_list = ','.join(self.se_uuid_list)
             payload = {
                 "metric_requests": [
                     {
                         "step": 300,
                         "limit": 1,
                         "aggregate_entity": False,
-                        "entity_uuid": "*",
+                        "entity_uuid": self.se_uuid_list,
                         "se_uuid": "*",
                         "id": "collItemRequest:AllSEs",
                         "metric_id": self.se_metric_list
@@ -697,7 +1246,7 @@ class avi_metrics():
                             "step": 5,
                             "limit": 1,
                             "aggregate_entity": False,
-                            "entity_uuid": "*",
+                            "entity_uuid": self.se_uuid_list,
                             "se_uuid": "*",
                             "id": "collItemRequest:AllSEs",
                             "metric_id": self.se_metric_list
@@ -763,12 +1312,17 @@ class avi_metrics():
         try:
             temp_start_time = time.time()
             #-----
+            if self.vs_uuid_list == []:
+                self.vs_uuid_list = '*'
+            else:
+                self.vs_uuid_list = ','.join(self.vs_uuid_list)
+            #-----
             endpoint_payload_list = []
-            payload =  {'metric_requests': [{'step' : 300, 'limit': 1, 'id': 'allvs', 'entity_uuid' : '*', 'metric_id': self.vs_metric_list}]}
+            payload =  {'metric_requests': [{'step' : 300, 'limit': 1, 'id': 'allvs', 'entity_uuid' : self.vs_uuid_list, 'metric_id': self.vs_metric_list}]}
             vs_stats = self.avi_post('analytics/metrics/collection?pad_missing_data=false', tenant, payload).json()
             #----- this pulls 5 sec avg stats for vs that have realtime stats enabled
             if self.vs_realtime == True:
-                payload =  {'metric_requests': [{'step' : 5, 'limit': 1, 'id': 'allvs', 'entity_uuid' : '*', 'metric_id': self.vs_metric_list}]}
+                payload =  {'metric_requests': [{'step' : 5, 'limit': 1, 'id': 'allvs', 'entity_uuid' : self.vs_uuid_list, 'metric_id': self.vs_metric_list}]}
                 realtime_stats = self.avi_post('analytics/metrics/collection?pad_missing_data=false', tenant, payload).json()
             #----- 
             for v in vs_stats['series']['allvs']:
@@ -797,6 +1351,15 @@ class avi_metrics():
                                                  if n['header']['name'] == m['header']['name']:
                                                      if 'data' in n:
                                                          temp_payload['metric_value'] = n['data'][0]['value']
+                                #----- add AKO markers to vs metric data
+                                if 'markers' in self.vs_dict[vs_uuid]['results'].keys():
+                                    for marker in self.vs_dict[vs_uuid]['results']['markers']:
+                                        if marker['key'] == 'clustername':
+                                            temp_payload['k8s_clustername'] = marker['values'][0]
+                                        elif marker['key'] == 'Namespace':
+                                            temp_payload['k8s_namespace'] = marker['values'][0]
+                                        elif marker['key'] == 'ServiceName':
+                                            temp_payload['k8s_servicename'] = marker['values'][0]
                                 endpoint_payload_list.append(temp_payload)
             if len(endpoint_payload_list) > 0:
                 send_metriclist_to_endpoint(self.endpoint_list, endpoint_payload_list)
@@ -840,11 +1403,17 @@ class avi_metrics():
         try:
             temp_start_time = time.time()
             endpoint_payload_list = []
-            payload =  {'metric_requests': [{'step' : 300, 'limit': 1, 'id': 'vs_metrics_by_se', 'entity_uuid' : '*', 'serviceengine_uuid': '*', 'include_refs': True, 'metric_id': self.vs_metric_list}]}
+            #-----
+            if self.vs_uuid_list == []:
+                self.vs_uuid_list = '*'
+            else:
+                self.vs_uuid_list = ','.join(self.vs_uuid_list)
+            #-----
+            payload =  {'metric_requests': [{'step' : 300, 'limit': 1, 'id': 'vs_metrics_by_se', 'entity_uuid' : self.vs_uuid_list, 'serviceengine_uuid': '*', 'include_refs': True, 'metric_id': self.vs_metric_list}]}
             vs_stats = self.avi_post('analytics/metrics/collection?include_name=true&pad_missing_data=false', tenant, payload).json()
             #----- this will pull 5 sec stats for vs that have realtime stat enabled
             if self.vs_realtime == True:
-                payload =  {'metric_requests': [{'step' : 5, 'limit': 1, 'id': 'vs_metrics_by_se', 'entity_uuid' : '*', 'serviceengine_uuid': '*', 'include_refs': True, 'metric_id': self.vs_metric_list}]}
+                payload =  {'metric_requests': [{'step' : 5, 'limit': 1, 'id': 'vs_metrics_by_se', 'entity_uuid' : self.vs_uuid_list, 'serviceengine_uuid': '*', 'include_refs': True, 'metric_id': self.vs_metric_list}]}
                 realtime_stats = self.avi_post('analytics/metrics/collection?include_name=true&pad_missing_data=false', tenant, payload).json()
             #------
             if len(vs_stats['series']['vs_metrics_by_se']) > 0:
@@ -877,6 +1446,15 @@ class avi_metrics():
                                         metric_name = d['header']['name']
                                         temp_payload['metric_name'] = metric_name+'_per_se'
                                         temp_payload['name_space'] = 'avi||'+self.avi_cluster_name+'||serviceengine||%s||virtualservice_stats||%s||%s' %(se_name,vs_name,temp_payload['metric_name'])
+                                        #----- add AKO markers to vs metric data
+                                        if 'markers' in self.vs_dict[entry]['results'].keys():
+                                            for marker in self.vs_dict[entry]['results']['markers']:
+                                                if marker['key'] == 'clustername':
+                                                    temp_payload['k8s_clustername'] = marker['values'][0]
+                                                elif marker['key'] == 'Namespace':
+                                                    temp_payload['k8s_namespace'] = marker['values'][0]
+                                                elif marker['key'] == 'ServiceName':
+                                                    temp_payload['k8s_servicename'] = marker['values'][0]
                                         endpoint_payload_list.append(temp_payload)
                 if len(endpoint_payload_list) > 0:
                     send_metriclist_to_endpoint(self.endpoint_list, endpoint_payload_list)
@@ -922,6 +1500,15 @@ class avi_metrics():
                 temp_payload['metric_name'] = 'oper_status'
                 temp_payload['metric_value'] = metric_value
                 temp_payload['name_space'] = 'avi||'+self.avi_cluster_name+'||virtualservice||%s||%s' %(vs_name, metric_name)
+                #----- add AKO markers to vs metric data
+                if 'markers' in self.vs_dict[v]['results'].keys():
+                    for marker in self.vs_dict[v]['results']['markers']:
+                        if marker['key'] == 'clustername':
+                            temp_payload['k8s_clustername'] = marker['values'][0]
+                        elif marker['key'] == 'Namespace':
+                            temp_payload['k8s_namespace'] = marker['values'][0]
+                        elif marker['key'] == 'ServiceName':
+                            temp_payload['k8s_servicename'] = marker['values'][0]
                 endpoint_payload_list.append(temp_payload)
             temp_payload = self.payload_template.copy()
             temp_payload['timestamp']=int(time.time())
@@ -1219,6 +1806,15 @@ class avi_metrics():
                             temp_payload['metric_name'] = 'hosting_se'
                             temp_payload['metric_value'] = 1
                             temp_payload['name_space'] = 'avi||'+self.avi_cluster_name+'||virtualservice||%s||serviceengine||%s' %(vs_name, se_name)
+                            #----- add AKO markers to vs metric data
+                            if 'markers' in self.vs_dict[v]['results'].keys():
+                                for marker in self.vs_dict[v]['results']['markers']:
+                                    if marker['key'] == 'clustername':
+                                        temp_payload['k8s_clustername'] = marker['values'][0]
+                                    elif marker['key'] == 'Namespace':
+                                        temp_payload['k8s_namespace'] = marker['values'][0]
+                                    elif marker['key'] == 'ServiceName':
+                                        temp_payload['k8s_servicename'] = marker['values'][0]                            
                             if temp_payload not in discovered:
                                 discovered.append(temp_payload)
                                 endpoint_payload_list.append(temp_payload)
@@ -1260,6 +1856,15 @@ class avi_metrics():
                                     temp_payload['metric_name'] = 'primary_se'
                                     temp_payload['metric_value'] = 1
                                     temp_payload['name_space'] = 'avi||'+self.avi_cluster_name+'||virtualservice||%s||primary_se||%s' %(vs_name,se_name)
+                                    #----- add AKO markers to vs metric data
+                                    if 'markers' in self.vs_dict[v]['results'].keys():
+                                        for marker in self.vs_dict[v]['results']['markers']:
+                                            if marker['key'] == 'clustername':
+                                                temp_payload['k8s_clustername'] = marker['values'][0]
+                                            elif marker['key'] == 'Namespace':
+                                                temp_payload['k8s_namespace'] = marker['values'][0]
+                                            elif marker['key'] == 'ServiceName':
+                                                temp_payload['k8s_servicename'] = marker['values'][0]
                                     endpoint_payload_list.append(temp_payload)
             if len(endpoint_payload_list) > 0:
                 send_metriclist_to_endpoint(self.endpoint_list, endpoint_payload_list)
@@ -1489,15 +2094,19 @@ class avi_metrics():
             temp_start_time = time.time()
             endpoint_payload_list = []
             discovered_servers = []
+            if self.pool_uuid_list == []:
+                self.pool_uuid_list = '*'
+            else:
+                self.pool_uuid_list = ','.join(self.pool_uuid_list)            
             payload = {
                 "metric_requests": [
                     {
                         "step": 300,
                         "limit": 1,
                         "aggregate_entity": False,
-                        "entity_uuid": "*",
+                        "entity_uuid": self.pool_uuid_list,
                         "obj_id": "*",
-                        "pool_uuid": "*",
+                        "pool_uuid": self.pool_uuid_list,
                         "id": "collItemRequest:AllServers",
                         "metric_id": self.pool_server_metric_list
                     }
@@ -1511,9 +2120,9 @@ class avi_metrics():
                             "step": 5,
                             "limit": 1,
                             "aggregate_entity": False,
-                            "entity_uuid": "*",
+                            "entity_uuid": self.pool_uuid_list,
                             "obj_id": "*",
-                            "pool_uuid": "*",
+                            "pool_uuid": self.pool_uuid_list,
                             "id": "collItemRequest:AllServers",
                             "metric_id": self.pool_server_metric_list
                         }
@@ -1538,17 +2147,20 @@ class avi_metrics():
                                     temp_payload['metric_type'] = 'pool_member_metrics'
                                     temp_payload['metric_name'] = metric_name
                                     temp_payload['metric_value'] = d['data'][0]['value']
+                                    vs_list = []
                                     if 'entity_ref' in d['header']:
                                         vs_name = d['header']['entity_ref'].rsplit('#',1)[1]
-                                        temp_payload['vs_name'] = vs_name
-                                        temp_payload['name_space'] = 'avi||%s||virtualservice||%s||pool||%s||%s||%s' %(self.avi_cluster_name,vs_name, pool_name, server_object,metric_name)
+                                        vs_list.append(vs_name)
+                                        #temp_payload['vs_name'] = vs_name
+                                        #temp_payload['name_space'] = 'avi||%s||virtualservice||%s||pool||%s||%s||%s' %(self.avi_cluster_name,vs_name, pool_name, server_object,metric_name)
                                         #endpoint_payload_list.append(temp_payload)
                                     else:
                                         for v in self.pool_dict[d['header']['pool_ref'].rsplit('#',1)[0].split('api/pool/')[1]]['results']['virtualservices']:
                                             vs_name = v.rsplit('#',1)[1]
                                             #temp_payload1 = temp_payload.copy()
-                                            temp_payload['vs_name'] = vs_name
-                                            temp_payload['name_space'] = 'avi||%s||virtualservice||%s||pool||%s||%s||%s' %(self.avi_cluster_name,vs_name, pool_name, server_object,metric_name)
+                                            #temp_payload['vs_name'] = vs_name
+                                            #temp_payload['name_space'] = 'avi||%s||virtualservice||%s||pool||%s||%s||%s' %(self.avi_cluster_name,vs_name, pool_name, server_object,metric_name)
+                                            vs_list.append(vs_name)
                                     if self.pool_realtime == True:
                                         if 'series' in realtime_stats:
                                             if p in realtime_stats['series']['collItemRequest:AllServers']:
@@ -1556,15 +2168,22 @@ class avi_metrics():
                                                     if n['header']['name'] == d['header']['name']:
                                                         if 'data' in n:
                                                             temp_payload['metric_value'] = n['data'][0]['value']
-                                    endpoint_payload_list.append(temp_payload)
+                                    #----- accomodate for pool being used by multiple vs
+                                    for v in vs_list:
+                                        temp_payload1 = temp_payload.copy()
+                                        temp_payload1['vs_name'] = v
+                                        temp_payload1['name_space'] = 'avi||%s||virtualservice||%s||pool||%s||%s||%s' %(self.avi_cluster_name,v, pool_name, server_object, metric_name)
+                                        endpoint_payload_list.append(temp_payload1)
             if len(endpoint_payload_list) > 0:
                 send_metriclist_to_endpoint(self.endpoint_list, endpoint_payload_list)
             temp_total_time = str(time.time()-temp_start_time)
             print(str(datetime.now())+' '+self.avi_cluster_ip+': func pool_server_stats for tenant '+tenant+', executed in '+temp_total_time+' seconds')
         except:
                 print(str(datetime.now())+' '+self.avi_cluster_ip+': func pool_server_stats  encountered an error for tenant '+tenant)
+                print(self.pool_uuid_list)
                 exception_text = traceback.format_exc()
                 print(str(datetime.now())+' '+self.avi_cluster_ip+': '+exception_text)
+                
 
 
 
@@ -1628,7 +2247,6 @@ class avi_metrics():
             start_time = time.time()
             self.login = self.avi_login()
             if self.login.status_code == 200:
-                self.tenants = self.login.json()['tenants']
                 #self.avi_controller = self.controller_to_poll()
                 #-----------------------------------
                 #----- Add Test functions to list for threaded execution
@@ -1676,6 +2294,10 @@ class avi_metrics():
                 #-----------------------------------
                 self.avi_controller = self.avi_cluster_ip
                 print('=====> Chose '+self.avi_controller)
+                #-----------------------------------
+                #self.tenants = self.login.json()['tenants']
+                self.tenants = self.return_tenants()
+                #-----------------------------------
                 self.vs_dict, self.se_dict, self.pool_dict, self.seg_dict = self.gen_inventory_dict()
                 #---- remove metrics that are not available in the current version
                 self.vs_metric_list, self.se_metric_list, self.controller_metric_list, self.pool_server_metric_list = self.remove_version_specific_metrics()
@@ -1772,13 +2394,15 @@ if 'EN_DOCKER' in os.environ:
             print(str(datetime.now())+' Error with Provided Configuration YAML')
             exception_text = traceback.format_exc()
             print(str(datetime.now())+' : '+exception_text)
-            sys.exit(1)        
+            sys.exit(1)    
+        time.sleep(60 - datetime.now().second)    
         while True:
             loop_start_time = time.time()
             avi_controller_list = configuration['controllers']
             if 'metrics_endpoint_config' in configuration:
                 global_endpoint_config = configuration['metrics_endpoint_config']
-            main()
+            if __name__ == '__main__':
+                main()
             loop_total_time = time.time()-loop_start_time
             if loop_total_time < 60:
                 print(str(datetime.now())+' AVI_SCRIPT: sleeping for '+str(60 - datetime.now().second)+' seconds')
@@ -1792,15 +2416,16 @@ else:
         configuration = False
         global_endpoint_config = None
         import yaml
-        print(fdir)
         if os.path.isfile(fdir+'/configuration.yaml') == True:
             with open(fdir+'/configuration.yaml', 'r') as yaml_file:
                 configuration = yaml.safe_load(yaml_file)
+            yaml_file.close()
             #----- Import avi controller info from json file
             if 'metrics_endpoint_config' in configuration:
                 global_endpoint_config = configuration['metrics_endpoint_config']
             avi_controller_list = configuration['controllers']
-            main()
+            if __name__ == '__main__':
+                main()
         else:
             print(str(datetime.now())+' No Configuration provided')    
     except:
@@ -1808,3 +2433,4 @@ else:
         exception_text = traceback.format_exc()
         print(str(datetime.now())+' : '+exception_text)
         sys.exit(1)
+

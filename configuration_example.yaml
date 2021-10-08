@@ -14,6 +14,10 @@ controllers:
          virtualservice_metrics: True
          virtualservice_realtime: False
          virtualservice_runtime: False
+         virtualservice_names:
+            - AutoScaleout-VS
+            - Avi-DemoAvi-VS
+            - WAF_Demo_VS
          virtualservice_metrics_list:
             - l4_client.avg_bandwidth
             - l4_client.avg_rx_pkts
@@ -155,6 +159,24 @@ controllers:
 #    #_comment":"Change metric_prefix only if you need to define a prefix",
 #    metric_prefix: ""
 #    #_comment":"If using auth on influxdb set auth-enabled to true and modify the credential values",
+#    auth-enabled: False
+#    username: admin
+#    password: password
+#
+#
+#
+##----------influxdb_v2------------
+#  - type: influxdb_v2
+#    enable: False
+#    server: 169.254.0.1
+#    server_port: 8086
+#    protocol: https
+#    org: avi
+#    bucket: avi
+#    token: YOURAUTHTOKEN
+#    #_comment":"Change metric_prefix only if you need to define a prefix",
+#    metric_prefix: ""
+#    #_comment":"If using auth on influxdb_v2 set auth-enabled to true and modify the credential values",
 #    auth-enabled: False
 #    username: admin
 #    password: password
